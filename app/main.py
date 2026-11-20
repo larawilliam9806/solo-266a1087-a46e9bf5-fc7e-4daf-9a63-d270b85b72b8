@@ -9,7 +9,12 @@ from fastapi.responses import JSONResponse
 
 from .errors import WeightingError
 from .io_utils import parse_respondent_csv, parse_target_csv
-from .models import RespondentBatch, TargetBatch
+from .models import (
+    RespondentBatch,
+    SupplementCompleteRequest,
+    SupplementPlanRequest,
+    TargetBatch,
+)
 from .service import WeightingService
 
 
@@ -115,6 +120,37 @@ def create_app(service: WeightingService | None = None) -> FastAPI:
     @app.get("/weighting/differences", tags=["结果领取"])
     async def group_differences():
         return app.state.service.get_differences()
+
+    # ------------------------------------------------------------------
+    # Supplementary-visit sampling
+    # ------------------------------------------------------------------
+    @app.post("/supplement/plans", tags=["补访入样"], status_code=201)
+    async def create_supplement_plan(request: SupplementPlanRequest):
+        candidates = [r.model_dump() for r in request.candidates]
+        return app.state.service.create_supplement_plan(
+            request.job_id, candidates
+        )
+
+    @app.get("/supplement/plans", tags=["补访入样"])
+    async def list_supplement_plans(
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ):
+        return app.state.service.list_supplement_plans(
+            limit=limit, offset=offset
+        )
+
+    @app.get("/supplement/plans/{plan_id}", tags=["补访入样"])
+    async def get_supplement_plan(plan_id: int):
+        return app.state.service.get_supplement_plan(plan_id)
+
+    @app.post("/supplement/plans/{plan_id}/completion", tags=["补访入样"])
+    async def complete_supplement_plan(
+        plan_id: int, request: SupplementCompleteRequest
+    ):
+        return app.state.service.complete_supplement_plan(
+            plan_id, request.responded_household_ids
+        )
 
     return app
 

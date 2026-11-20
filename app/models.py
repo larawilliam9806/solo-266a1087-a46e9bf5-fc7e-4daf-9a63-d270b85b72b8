@@ -72,3 +72,24 @@ class TargetIn(BaseModel):
 
 class TargetBatch(BaseModel):
     records: list[TargetIn] = Field(..., min_length=1)
+
+
+class SupplementPlanRequest(BaseModel):
+    """无法配平的作业号 + 至多 30 户候补资料（字段沿用应答名单）。"""
+
+    job_id: int = Field(..., gt=0)
+    candidates: list[RespondentIn] = Field(..., min_length=1, max_length=30)
+
+
+class SupplementCompleteRequest(BaseModel):
+    """补访结束后凭方案号回交的已应答户号。"""
+
+    responded_household_ids: list[StrictStr] = Field(..., min_length=1)
+
+    @field_validator("responded_household_ids")
+    @classmethod
+    def _non_blank_ids(cls, values: list[str]) -> list[str]:
+        cleaned = [v.strip() for v in values]
+        if any(not v for v in cleaned):
+            raise ValueError("household_id must not be blank")
+        return cleaned

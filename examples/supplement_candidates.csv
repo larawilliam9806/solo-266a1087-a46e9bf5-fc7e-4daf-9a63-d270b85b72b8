@@ -1,0 +1,6 @@
+household_id,district,size_band,init_weight
+C0001,Dongcheng,S1,1.0
+C0002,Dongcheng,S1,1.5
+C0003,Xicheng,S2,2.0
+C0004,Chaoyang,S3,1.0
+C0005,Haidian,S1,2.5

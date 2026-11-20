@@ -41,3 +41,48 @@ class NoResultError(WeightingError):
 class JobRunningError(WeightingError):
     status_code = 409
     code = "weighting_in_progress"
+
+
+class JobNotFoundError(WeightingError):
+    status_code = 404
+    code = "job_not_found"
+
+
+class JobNotUnbalancedError(WeightingError):
+    status_code = 409
+    code = "job_not_unbalanced"
+
+
+class PlanNotFoundError(WeightingError):
+    status_code = 404
+    code = "plan_not_found"
+
+
+class PlanNotSolvedError(WeightingError):
+    status_code = 409
+    code = "plan_not_actionable"
+
+
+class PlanVersionMismatchError(WeightingError):
+    status_code = 409
+    code = "source_version_changed"
+
+
+class ResponseMismatchError(WeightingError):
+    status_code = 409
+    code = "response_mismatch"
+
+
+class PlanConflictError(WeightingError):
+    status_code = 409
+    code = "supplement_conflict"
+
+
+class SupplementSolveError(WeightingError):
+    status_code = 500
+    code = "supplement_solve_failed"
+
+
+class MergeFailedError(WeightingError):
+    status_code = 500
+    code = "supplement_merge_failed"

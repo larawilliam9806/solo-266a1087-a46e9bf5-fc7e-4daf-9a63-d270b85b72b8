@@ -89,6 +89,50 @@ CREATE TABLE IF NOT EXISTS diff_results (
     PRIMARY KEY (job_id, dimension, group_name),
     FOREIGN KEY (job_id) REFERENCES weighting_jobs(id)
 );
+
+CREATE TABLE IF NOT EXISTS supplement_plans (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id               INTEGER NOT NULL,
+    respondent_version   INTEGER NOT NULL,
+    target_version       INTEGER NOT NULL,
+    status               TEXT NOT NULL
+                         CHECK (status IN ('solved', 'no_solution',
+                                           'completed', 'failed')),
+    candidate_count      INTEGER NOT NULL,
+    selected_count       INTEGER,
+    no_solution_reason   TEXT,
+    best_gap             REAL,
+    error_reason         TEXT,
+    merged_respondent_version INTEGER,
+    merged_job_id        INTEGER,
+    created_at           TEXT NOT NULL,
+    completed_at         TEXT,
+    FOREIGN KEY (job_id) REFERENCES weighting_jobs(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_plans_job ON supplement_plans(job_id);
+
+CREATE TABLE IF NOT EXISTS supplement_plan_households (
+    plan_id       INTEGER NOT NULL,
+    household_id  TEXT NOT NULL,
+    district      TEXT NOT NULL,
+    size_band     TEXT NOT NULL,
+    init_weight   REAL NOT NULL CHECK (init_weight > 0),
+    is_selected   INTEGER NOT NULL CHECK (is_selected IN (0, 1)),
+    PRIMARY KEY (plan_id, household_id),
+    FOREIGN KEY (plan_id) REFERENCES supplement_plans(id)
+);
+
+CREATE TABLE IF NOT EXISTS supplement_plan_diagnostics (
+    plan_id       INTEGER NOT NULL,
+    dimension     TEXT NOT NULL,
+    group_name    TEXT NOT NULL,
+    weighted      REAL NOT NULL,
+    target_count  REAL NOT NULL,
+    difference    REAL NOT NULL,
+    PRIMARY KEY (plan_id, dimension, group_name),
+    FOREIGN KEY (plan_id) REFERENCES supplement_plans(id)
+);
 """
 
 

@@ -25,11 +25,20 @@ from datetime import datetime, timezone
 
 from . import database, weighting
 from .errors import (
+    JobNotFoundError,
+    JobNotUnbalancedError,
     JobRunningError,
+    MergeFailedError,
     MissingTableError,
     MissingTargetsError,
     NoResultError,
     NotReadyError,
+    PlanConflictError,
+    PlanNotFoundError,
+    PlanNotSolvedError,
+    PlanVersionMismatchError,
+    ResponseMismatchError,
+    SupplementSolveError,
     ValidationError,
 )
 
@@ -40,6 +49,13 @@ STATUS_LABELS = {
     "balanced": "已配平",
     "unbalanced": "无法配平",
     "failed": "计算失败",
+}
+
+PLAN_STATUS_LABELS = {
+    "solved": "已求得补访方案",
+    "no_solution": "无可行补访方案",
+    "completed": "补访应答已并入正式名单",
+    "failed": "补访计算失败",
 }
 
 
@@ -656,4 +672,446 @@ class WeightingService:
             return {
                 "respondents": r_meta,
                 "targets": t_meta,
+            }
+
+    # ------------------------------------------------------------------
+    # Supplementary-visit plans
+    # ------------------------------------------------------------------
+    def _validate_candidates(self, candidates: list[dict]) -> list[dict]:
+        """Same field rules as the roster (which also enforces mutually
+        unique household ids within the payload)."""
+        self._validate_respondents(candidates)
+        return [
+            {
+                "household_id": c["household_id"].strip(),
+                "district": c["district"].strip(),
+                "size_band": c["size_band"].strip(),
+                "init_weight": float(c["init_weight"]),
+            }
+            for c in candidates
+        ]
+
+    def _load_job(self, conn: sqlite3.Connection, job_id: int) -> sqlite3.Row:
+        job = conn.execute(
+            "SELECT * FROM weighting_jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        if job is None:
+            raise JobNotFoundError(
+                "作业号不存在", {"job_id": job_id}
+            )
+        return job
+
+    def create_supplement_plan(
+        self, job_id: int, candidates_raw: list[dict]
+    ) -> dict:
+        with self._lock, database.db_session(self._db_path) as conn:
+            job = self._load_job(conn, job_id)
+            r_ver, t_ver = job["respondent_version"], job["target_version"]
+            if job["status"] != "unbalanced":
+                raise JobNotUnbalancedError(
+                    "仅无法配平的作业可以发起补访选户",
+                    {
+                        "job_id": job_id,
+                        "job_status": job["status"],
+                    },
+                )
+            if not self._pair_is_current(conn, r_ver, t_ver):
+                raise PlanVersionMismatchError(
+                    "作业对应的两表版本已不是当前版本，"
+                    "请基于当前版本重新配权后再发起补访",
+                    {
+                        "job_id": job_id,
+                        "job_respondent_version": r_ver,
+                        "job_target_version": t_ver,
+                        "current_respondent_version":
+                            self._current_version(conn, "respondents"),
+                        "current_target_version":
+                            self._current_version(conn, "targets"),
+                    },
+                )
+            candidates = self._validate_candidates(candidates_raw)
+
+            households = self._load_respondents(conn, r_ver)
+            sampled = {hh["household_id"] for hh in households}
+            duplicates = sorted(
+                {c["household_id"] for c in candidates} & sampled
+            )
+            if duplicates:
+                raise ValidationError(
+                    "候补户号必须尚未入样，以下户号已在应答名单中",
+                    {"already_sampled": duplicates},
+                )
+            target_rows = self._load_targets(conn, t_ver)
+            target_tuples = [
+                (t["dimension"], t["group_name"], t["target_count"])
+                for t in target_rows
+            ]
+            # Candidates must only use groups covered by the pinned targets.
+            covered = {(t["dimension"], t["group_name"]) for t in target_rows}
+            missing_groups: list[dict] = []
+            for c in candidates:
+                for dimension, key in (
+                    ("district", c["district"]),
+                    ("size_band", c["size_band"]),
+                ):
+                    item = {"dimension": dimension, "group_name": key}
+                    if (dimension, key) not in covered and item not in missing_groups:
+                        missing_groups.append(item)
+            if missing_groups:
+                raise MissingTargetsError(
+                    "总体目标表缺少候补户所在分组的目标",
+                    {"missing_group_targets": missing_groups},
+                )
+
+        # Heavy MIP work runs outside the database lock.
+        result = weighting.select_minimum_supplement(
+            households, candidates, target_tuples
+        )
+
+        with self._lock, database.db_session(self._db_path) as conn:
+            # Tables may have been swapped while the MIP was running.
+            if not self._pair_is_current(conn, r_ver, t_ver):
+                raise PlanVersionMismatchError(
+                    "两表已换版，该作业对应的源表版本不再是当前版本，"
+                    "请基于当前版本重新配权后再发起补访",
+                    {
+                        "job_id": job_id,
+                        "job_respondent_version": r_ver,
+                        "job_target_version": t_ver,
+                        "current_respondent_version":
+                            self._current_version(conn, "respondents"),
+                        "current_target_version":
+                            self._current_version(conn, "targets"),
+                    },
+                )
+            if result.failure_reason is not None:
+                # Solver malfunction: nothing stored, live data untouched.
+                raise SupplementSolveError(
+                    result.failure_reason, {"job_id": job_id}
+                )
+
+            selected_set = set(result.selected)
+            status = "solved" if result.feasible else "no_solution"
+            reason = None
+            if not result.feasible:
+                reason = (
+                    "全部候补户入样后仍无法同时配平区县与家庭人数档；"
+                    "请参考各组差额增补对应分组的候补户"
+                )
+            cur = conn.execute(
+                "INSERT INTO supplement_plans"
+                "(job_id, respondent_version, target_version, status, "
+                " candidate_count, selected_count, no_solution_reason, "
+                " best_gap, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    job_id, r_ver, t_ver, status, len(candidates),
+                    len(selected_set) if result.feasible else None,
+                    reason,
+                    result.best_gap,
+                    _utc_now(),
+                ),
+            )
+            plan_id = cur.lastrowid
+            conn.executemany(
+                "INSERT INTO supplement_plan_households"
+                "(plan_id, household_id, district, size_band, "
+                " init_weight, is_selected) VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        plan_id,
+                        c["household_id"],
+                        c["district"],
+                        c["size_band"],
+                        c["init_weight"],
+                        1 if c["household_id"] in selected_set else 0,
+                    )
+                    for c in candidates
+                ],
+            )
+            if not result.feasible:
+                conn.executemany(
+                    "INSERT INTO supplement_plan_diagnostics"
+                    "(plan_id, dimension, group_name, weighted, "
+                    " target_count, difference) VALUES (?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            plan_id,
+                            d["dimension"],
+                            d["group_name"],
+                            d["weighted_count"],
+                            d["target_count"],
+                            d["difference"],
+                        )
+                        for d in result.group_diffs
+                    ],
+                )
+            conn.commit()
+
+        body = {
+            "plan_id": plan_id,
+            "job_id": job_id,
+            "status": status,
+            "status_label": PLAN_STATUS_LABELS[status],
+            "respondent_version": r_ver,
+            "target_version": t_ver,
+            "candidate_count": len(candidates),
+        }
+        if result.feasible:
+            body["selected_count"] = len(selected_set)
+            body["selected_household_ids"] = result.selected
+            body["message"] = (
+                f"最少需补访 {len(selected_set)} 户即可同时配平两个维度"
+            )
+        else:
+            body["selected_count"] = None
+            body["selected_household_ids"] = []
+            body["no_solution_reason"] = reason
+            body["best_gap"] = result.best_gap
+            body["blocking_groups"] = result.blocking_groups
+            body["diagnostics"] = result.group_diffs
+            body["message"] = reason
+        return body
+
+    def _load_plan(self, conn: sqlite3.Connection, plan_id: int) -> sqlite3.Row:
+        plan = conn.execute(
+            "SELECT * FROM supplement_plans WHERE id = ?", (plan_id,)
+        ).fetchone()
+        if plan is None:
+            raise PlanNotFoundError(
+                "补访方案号不存在", {"plan_id": plan_id}
+            )
+        return plan
+
+    def complete_supplement_plan(
+        self, plan_id: int, responded_ids: list[str]
+    ) -> dict:
+        responded = [hid.strip() for hid in responded_ids if hid.strip()]
+        with self._lock, database.db_session(self._db_path) as conn:
+            plan = self._load_plan(conn, plan_id)
+            if plan["status"] != "solved":
+                raise PlanNotSolvedError(
+                    "仅状态为「已求得补访方案」的方案可以回交应答户",
+                    {"plan_id": plan_id, "plan_status": plan["status"]},
+                )
+            r_ver = plan["respondent_version"]
+            t_ver = plan["target_version"]
+
+            selected_rows = conn.execute(
+                "SELECT household_id, district, size_band, init_weight "
+                "FROM supplement_plan_households WHERE plan_id = ? "
+                "AND is_selected = 1 ORDER BY household_id",
+                (plan_id,),
+            ).fetchall()
+            selected = [dict(r) for r in selected_rows]
+            selected_ids = [r["household_id"] for r in selected]
+            selected_set = set(selected_ids)
+            responded_set = set(responded)
+
+            if responded_set != selected_set or len(responded_set) != len(responded):
+                raise ResponseMismatchError(
+                    "应答户须与入选户完全一致（同集合、无重复、无缺漏）",
+                    {
+                        "plan_id": plan_id,
+                        "selected_household_ids": selected_ids,
+                        "responded_household_ids": responded,
+                        "missing": sorted(selected_set - responded_set),
+                        "unexpected": sorted(responded_set - selected_set),
+                    },
+                )
+
+            # The pinned source tables must still be the live versions.
+            if not self._pair_is_current(conn, r_ver, t_ver):
+                raise PlanVersionMismatchError(
+                    "两表已换版，方案绑定的源表版本不再是当前版本，"
+                    "正式名单与供数保持不变",
+                    {
+                        "plan_id": plan_id,
+                        "plan_respondent_version": r_ver,
+                        "plan_target_version": t_ver,
+                        "current_respondent_version":
+                            self._current_version(conn, "respondents"),
+                        "current_target_version":
+                            self._current_version(conn, "targets"),
+                    },
+                )
+
+            households = self._load_respondents(conn, r_ver)
+            target_rows = self._load_targets(conn, t_ver)
+            target_tuples = [
+                (t["dimension"], t["group_name"], t["target_count"])
+                for t in target_rows
+            ]
+            merged = households + selected
+
+        # Recompute official weights for the merged roster under the original
+        # two-stage rule; done outside the lock.
+        try:
+            result = weighting.solve(merged, target_tuples)
+        except Exception as exc:
+            raise MergeFailedError(
+                f"并入后按原规则重算异常: {exc!r}",
+                {"plan_id": plan_id},
+            )
+
+        with self._lock, database.db_session(self._db_path) as conn:
+            # Re-check every precondition inside the write transaction. Any
+            # failure rolls back, leaving the live roster and supply intact.
+            try:
+                if result.failure_reason is not None:
+                    raise MergeFailedError(
+                        f"并入后按原规则重算失败: {result.failure_reason}",
+                        {"plan_id": plan_id},
+                    )
+                if not result.balanced:
+                    raise MergeFailedError(
+                        "并入候补户后按原规则仍无法配平，已保留原正式名单与供数",
+                        {"plan_id": plan_id, "objective_gap": result.gap},
+                    )
+                plan_now = conn.execute(
+                    "SELECT status FROM supplement_plans WHERE id = ?",
+                    (plan_id,),
+                ).fetchone()
+                if plan_now is None or plan_now["status"] != "solved":
+                    raise PlanConflictError(
+                        "方案状态已变化，无法并入",
+                        {"plan_id": plan_id},
+                    )
+                if not self._pair_is_current(conn, r_ver, t_ver):
+                    raise PlanVersionMismatchError(
+                        "两表已换版，正式名单与供数保持不变",
+                        {"plan_id": plan_id},
+                    )
+
+                digest = _content_hash(merged)
+                new_r_ver = self._insert_respondent_snapshot(
+                    conn, merged, digest
+                )
+                cur = conn.execute(
+                    "INSERT INTO weighting_jobs"
+                    "(respondent_version, target_version, status, "
+                    " is_balanced, objective_gap, created_at, finished_at) "
+                    "VALUES (?, ?, 'balanced', 1, ?, ?, ?)",
+                    (new_r_ver, t_ver, result.gap, _utc_now(), _utc_now()),
+                )
+                new_job_id = cur.lastrowid
+                conn.executemany(
+                    "INSERT INTO weight_results"
+                    "(job_id, household_id, weight) VALUES (?, ?, ?)",
+                    [
+                        (new_job_id, hh["household_id"], w)
+                        for hh, w in zip(merged, result.weights)
+                    ],
+                )
+                conn.executemany(
+                    "INSERT INTO diff_results"
+                    "(job_id, dimension, group_name, weighted, "
+                    " target_count, difference) VALUES (?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            new_job_id,
+                            d["dimension"],
+                            d["group_name"],
+                            d["weighted_count"],
+                            d["target_count"],
+                            d["difference"],
+                        )
+                        for d in result.group_diffs
+                    ],
+                )
+                conn.execute(
+                    "INSERT INTO current_versions(table_name, version) "
+                    "VALUES ('respondents', ?) "
+                    "ON CONFLICT(table_name) DO UPDATE SET "
+                    "version = excluded.version",
+                    (new_r_ver,),
+                )
+                conn.execute(
+                    "UPDATE supplement_plans SET status='completed', "
+                    "merged_respondent_version=?, merged_job_id=?, "
+                    "completed_at=? WHERE id=?",
+                    (new_r_ver, new_job_id, _utc_now(), plan_id),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        return {
+            "plan_id": plan_id,
+            "status": "completed",
+            "status_label": PLAN_STATUS_LABELS["completed"],
+            "respondent_version": new_r_ver,
+            "target_version": t_ver,
+            "job_id": new_job_id,
+            "merged_household_count": len(merged),
+            "added_household_ids": selected_ids,
+            "objective_gap": result.gap,
+            "message": (
+                "补访应答户已并入正式名单，新名单与按原规则计算的正式权重"
+                "同时生效"
+            ),
+        }
+
+    def get_supplement_plan(self, plan_id: int) -> dict:
+        with self._lock, database.db_session(self._db_path) as conn:
+            plan = self._load_plan(conn, plan_id)
+            rows = conn.execute(
+                "SELECT household_id, district, size_band, init_weight, "
+                "is_selected FROM supplement_plan_households "
+                "WHERE plan_id = ? ORDER BY household_id",
+                (plan_id,),
+            ).fetchall()
+            body = {
+                "plan_id": plan["id"],
+                "job_id": plan["job_id"],
+                "status": plan["status"],
+                "status_label": PLAN_STATUS_LABELS[plan["status"]],
+                "respondent_version": plan["respondent_version"],
+                "target_version": plan["target_version"],
+                "candidate_count": plan["candidate_count"],
+                "selected_count": plan["selected_count"],
+                "selected_household_ids": [
+                    r["household_id"] for r in rows if r["is_selected"]
+                ],
+                "candidates": [dict(r) for r in rows],
+                "created_at": plan["created_at"],
+                "completed_at": plan["completed_at"],
+                "merged_respondent_version":
+                    plan["merged_respondent_version"],
+                "merged_job_id": plan["merged_job_id"],
+            }
+            if plan["status"] == "no_solution":
+                body["no_solution_reason"] = plan["no_solution_reason"]
+                body["best_gap"] = plan["best_gap"]
+                diag = conn.execute(
+                    "SELECT dimension, group_name, weighted AS "
+                    "weighted_count, target_count, difference "
+                    "FROM supplement_plan_diagnostics WHERE plan_id = ? "
+                    "ORDER BY dimension, group_name",
+                    (plan_id,),
+                ).fetchall()
+                body["diagnostics"] = [dict(r) for r in diag]
+            return body
+
+    def list_supplement_plans(self, limit: int = 50, offset: int = 0) -> dict:
+        with self._lock, database.db_session(self._db_path) as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) AS c FROM supplement_plans"
+            ).fetchone()["c"]
+            rows = conn.execute(
+                "SELECT id AS plan_id, job_id, status, respondent_version, "
+                "target_version, candidate_count, selected_count, "
+                "created_at, completed_at FROM supplement_plans "
+                "ORDER BY id DESC LIMIT ? OFFSET ?",
+                (int(limit), int(offset)),
+            ).fetchall()
+            plans = [dict(r) for r in rows]
+            for plan in plans:
+                plan["status_label"] = PLAN_STATUS_LABELS[plan["status"]]
+            return {
+                "total_count": total,
+                "limit": limit,
+                "offset": offset,
+                "plans": plans,
             }

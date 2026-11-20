@@ -16,6 +16,11 @@ Absolute values are modelled with non-negative slack pairs:
 The factor bounds make the feasible region a non-empty compact box, so both
 LPs always have an optimum; any non-optimal solver status is reported as a
 computation failure instead of returning partial numbers.
+
+Supplementary-visit selection (``select_minimum_supplement``) is a mixed
+integer programme: each candidate household gets a binary selection variable
+and a weight that is either zero (not selected) or inside the same
+0.5x..2x factor box (selected); the objective minimises the number selected.
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ from __future__ import annotations
 import math
 import os
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import highspy
 import numpy as np
@@ -33,6 +38,10 @@ UPPER_FACTOR = 2.0
 # Extra slack (in household units) allowed when freezing the stage-1 optimum.
 GAP_TOLERANCE = 1e-6
 BALANCED_TOLERANCE = 1e-5
+# Upper bound on the MIP solve for minimum supplementary selection.
+SUPPLEMENT_TIME_LIMIT = 60.0
+# Binary variables are treated as selected above this threshold.
+BINARY_TOLERANCE = 1e-6
 
 
 @contextmanager
@@ -217,3 +226,164 @@ def solve(households: list[dict], target_rows: list[dict]) -> SolveResult:
         gap=gap,
         group_diffs=group_diffs,
     )
+
+
+# ----------------------------------------------------------------------
+# Supplementary-visit selection (minimum-cardinality MIP)
+# ----------------------------------------------------------------------
+@dataclass
+class SupplementResult:
+    feasible: bool
+    selected: list[str] = field(default_factory=list)
+    failure_reason: str | None = None
+    # Diagnostics populated when no selection can balance both dimensions.
+    best_gap: float | None = None
+    group_diffs: list[dict] = field(default_factory=list)
+    blocking_groups: list[dict] = field(default_factory=list)
+
+
+def _membership_for(
+    households: list[dict], groups: list[Group]
+) -> list[np.ndarray]:
+    return [
+        np.asarray(
+            [
+                i
+                for i, hh in enumerate(households)
+                if hh[group.dimension] == group.name
+            ],
+            dtype=np.int32,
+        )
+        for group in groups
+    ]
+
+
+def _blocking_groups(
+    households: list[dict], groups: list[Group]
+) -> list[dict]:
+    """Groups whose target is unreachable even when every household is at a
+    factor bound.  These alone prove the balance equations are infeasible.
+    """
+    blocking: list[dict] = []
+    for group in groups:
+        init_sum = sum(
+            float(hh["init_weight"])
+            for hh in households
+            if hh[group.dimension] == group.name
+        )
+        lo = LOWER_FACTOR * init_sum
+        hi = UPPER_FACTOR * init_sum
+        if group.target < lo - BALANCED_TOLERANCE or group.target > hi + BALANCED_TOLERANCE:
+            blocking.append(
+                {
+                    "dimension": group.dimension,
+                    "group_name": group.name,
+                    "target_count": float(group.target),
+                    "min_weighted_count": float(lo),
+                    "max_weighted_count": float(hi),
+                }
+            )
+    return blocking
+
+
+def select_minimum_supplement(
+    households: list[dict],
+    candidates: list[dict],
+    target_rows: list[dict],
+) -> SupplementResult:
+    """Pick the fewest candidate households that make both dimensions balance.
+
+    Variables per original household ``i``: continuous weight ``w_i`` in
+    ``[0.5 init_i, 2 init_i]``.  Per candidate ``j``: continuous weight
+    ``u_j >= 0`` plus binary ``z_j``, linked by big-M constraints
+    ``0.5 init_j z_j <= u_j <= 2 init_j z_j`` so an unselected candidate
+    contributes zero weight while a selected one obeys the same factor box.
+    Every group equality must hold exactly, hence the optimum objective is
+    the minimum number of supplementary visits.
+    """
+    n = len(households)
+    k = len(candidates)
+    groups = [Group(d, g, float(t)) for d, g, t in target_rows]
+
+    init = np.array([h["init_weight"] for h in households], dtype=float)
+    cand_init = np.array([c["init_weight"] for c in candidates], dtype=float)
+    lower = LOWER_FACTOR * init
+    upper = UPPER_FACTOR * init
+
+    # Column layout: [w (n), u (k), z (k)]
+    total = n + 2 * k
+    h = _new_highs()
+    h.setOptionValue("mip_rel_gap", 0.0)
+    h.setOptionValue("mip_abs_gap", 0.0)
+    h.setOptionValue("time_limit", SUPPLEMENT_TIME_LIMIT)
+    h.addVars(
+        total,
+        np.concatenate([lower, np.zeros(2 * k)]),
+        np.concatenate([
+            upper,
+            UPPER_FACTOR * cand_init,
+            np.ones(k),
+        ]),
+    )
+    # Binary selection variables (integer with [0, 1] bounds).
+    h.changeColsIntegrality(
+        k,
+        np.arange(n + k, n + 2 * k, dtype=np.int32),
+        np.full(k, highspy.HighsVarType.kInteger),
+    )
+    # Minimise the number of selected candidates.
+    h.changeColsCost(
+        k, np.arange(n + k, n + 2 * k, dtype=np.int32), np.ones(k)
+    )
+
+    all_households = households + candidates
+    membership = _membership_for(all_households, groups)
+    for gi, members in enumerate(membership):
+        # Pure equalities: every group must be hit exactly (gap-free balance).
+        idx = members.astype(np.int32)
+        val = np.ones(len(members))
+        t = float(groups[gi].target)
+        h.addRow(t, t, len(idx), idx, val)
+
+    # Big-M link between each candidate weight and its binary selector.
+    for j in range(k):
+        col_u = n + j
+        col_z = n + k + j
+        pair = np.array([col_u, col_z], dtype=np.int32)
+        # u_j - 2*init_j * z_j <= 0
+        h.addRow(
+            -highspy.kHighsInf, 0.0, 2, pair,
+            np.array([1.0, -UPPER_FACTOR * float(cand_init[j])]),
+        )
+        # -u_j + 0.5*init_j * z_j <= 0
+        h.addRow(
+            -highspy.kHighsInf, 0.0, 2, pair,
+            np.array([-1.0, LOWER_FACTOR * float(cand_init[j])]),
+        )
+
+    h.run()
+    status = h.getModelStatus()
+    if status == highspy.HighsModelStatus.kInfeasible:
+        # Quantify why: best achievable gap using originals + all candidates.
+        diagnostic = solve(all_households, target_rows)
+        return SupplementResult(
+            feasible=False,
+            failure_reason=None,
+            best_gap=diagnostic.gap,
+            group_diffs=diagnostic.group_diffs,
+            blocking_groups=_blocking_groups(all_households, groups),
+        )
+    if status != highspy.HighsModelStatus.kOptimal:
+        return SupplementResult(
+            feasible=False,
+            failure_reason=f"补访选户混合整数规划未取得最优解: {h.modelStatusToString(status)}",
+        )
+
+    solution = np.asarray(h.getSolution().col_value, dtype=float)
+    z = solution[n + k:n + 2 * k]
+    selected = [
+        candidates[j]["household_id"]
+        for j in range(k)
+        if z[j] > 1.0 - BINARY_TOLERANCE
+    ]
+    return SupplementResult(feasible=True, selected=selected)
